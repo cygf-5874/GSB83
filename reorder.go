@@ -22,14 +22,16 @@ var (
 
 // Orderer holds the nodes and dependency relations.
 //
-// This implementation is correct but rebuilds the whole arrangement on every
-// call to Order.
+// The accepted topological order is maintained incrementally after it has
+// first been materialized.
 type Orderer struct {
-	nodes map[int]bool
-	succ  map[int][]int // succ[a] = nodes that must come after a
-	pred  map[int][]int // pred[b] = nodes that must come before b
-	prev  []int         // previous output order (baseline for minimal churn)
-	stats Stats
+	nodes       map[int]bool
+	succ        map[int][]int // succ[a] = nodes that must come after a
+	pred        map[int][]int // pred[b] = nodes that must come before b
+	prev        []int         // previous output order (baseline for minimal churn)
+	order       []int         // current accepted topological order
+	initialized bool
+	stats       Stats
 }
 
 // NewOrderer builds an orderer over ids. Each element of deps is {before, after}
@@ -101,6 +103,7 @@ func (o *Orderer) Insert(id int, after []int) error {
 	o.nodes[id] = true
 	o.stats.Allocs++
 	for a := range uniq {
+		o.stats.Compares++
 		o.succ[a] = append(o.succ[a], id)
 		o.pred[id] = append(o.pred[id], a)
 	}
@@ -109,6 +112,9 @@ func (o *Orderer) Insert(id int, after []int) error {
 	}
 	sort.Ints(o.pred[id])
 	o.prev = append(o.prev, id)
+	if o.initialized {
+		o.order = append(o.order, id)
+	}
 	return nil
 }
 
@@ -129,22 +135,31 @@ func (o *Orderer) Delete(id int) error {
 	}
 	delete(o.succ, id)
 	delete(o.pred, id)
-	for i, x := range o.prev {
-		if x == id {
-			o.prev = append(o.prev[:i:i], o.prev[i+1:]...)
-			break
-		}
+	o.prev = removeOrderID(o.prev, id)
+	if o.initialized {
+		o.order = removeOrderID(o.order, id)
 	}
 	return nil
 }
 
 // Order returns an order of the current nodes that satisfies every dependency
 // and differs as little as possible from the previous output. The result is a
-// fresh slice. The call rebuilds the whole arrangement from scratch.
+// fresh slice.
 func (o *Orderer) Order() []int {
-	o.stats.Rebuilds++
-	o.stats.Allocs++
+	if !o.initialized {
+		res := o.buildInitialOrder()
+		o.prev = append([]int(nil), res...)
+		o.order = append([]int(nil), res...)
+		o.initialized = true
+		o.stats.Allocs += 2
+		return append([]int(nil), res...)
+	}
 
+	o.stats.Allocs++
+	return append([]int(nil), o.order...)
+}
+
+func (o *Orderer) buildInitialOrder() []int {
 	ids := make([]int, 0, len(o.nodes))
 	for id, ok := range o.nodes {
 		if ok {
@@ -182,9 +197,7 @@ func (o *Orderer) Order() []int {
 		}
 	}
 
-	o.prev = append([]int(nil), res...)
-	o.stats.Allocs++
-	return append([]int(nil), res...)
+	return res
 }
 
 // Stats returns a snapshot of the internal work counters.
@@ -231,6 +244,15 @@ func removeInt(s []int, v int) []int {
 		}
 	}
 	return out
+}
+
+func removeOrderID(s []int, id int) []int {
+	for i, x := range s {
+		if x == id {
+			return append(s[:i:i], s[i+1:]...)
+		}
+	}
+	return s
 }
 
 // hItem is a node queued for ordering, keyed by its position in the previous
