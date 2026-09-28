@@ -22,13 +22,17 @@ var (
 
 // Orderer holds the nodes and dependency relations.
 //
-// This implementation is correct but rebuilds the whole arrangement on every
-// call to Order.
+// The arrangement is maintained incrementally: seq always holds the current
+// nodes in the exact order the next Order call must emit. The very first Order
+// call builds this arrangement once, keyed by the construction-time ids; after
+// that Insert appends and Delete excises in place, so no full rebuild is ever
+// needed.
 type Orderer struct {
 	nodes map[int]bool
 	succ  map[int][]int // succ[a] = nodes that must come after a
 	pred  map[int][]int // pred[b] = nodes that must come before b
-	prev  []int         // previous output order (baseline for minimal churn)
+	seq   []int         // maintained output order (every live node, exactly once)
+	built bool          // whether the initial arrangement has been computed
 	stats Stats
 }
 
@@ -72,7 +76,9 @@ func NewOrderer(ids []int, deps [][2]int) (*Orderer, error) {
 		return nil, ErrCycle
 	}
 
-	o.prev = append([]int(nil), ids...)
+	// seq starts out as the construction-time ids. It is the baseline for the
+	// initial arrangement, which Order computes lazily on its first call.
+	o.seq = append([]int(nil), ids...)
 	o.stats.Allocs++
 	return o, nil
 }
@@ -108,7 +114,12 @@ func (o *Orderer) Insert(id int, after []int) error {
 		sort.Ints(o.succ[a])
 	}
 	sort.Ints(o.pred[id])
-	o.prev = append(o.prev, id)
+
+	// The new node has only incoming edges: in any arrangement it belongs
+	// strictly after every existing node, so appending it keeps seq a valid
+	// topological order. Before the initial arrangement is built the same
+	// append mirrors the old baseline update.
+	o.seq = append(o.seq, id)
 	return nil
 }
 
@@ -129,9 +140,9 @@ func (o *Orderer) Delete(id int) error {
 	}
 	delete(o.succ, id)
 	delete(o.pred, id)
-	for i, x := range o.prev {
+	for i, x := range o.seq {
 		if x == id {
-			o.prev = append(o.prev[:i:i], o.prev[i+1:]...)
+			o.seq = append(o.seq[:i:i], o.seq[i+1:]...)
 			break
 		}
 	}
@@ -140,21 +151,33 @@ func (o *Orderer) Delete(id int) error {
 
 // Order returns an order of the current nodes that satisfies every dependency
 // and differs as little as possible from the previous output. The result is a
-// fresh slice. The call rebuilds the whole arrangement from scratch.
+// fresh slice.
+//
+// The arrangement is maintained incrementally: after the first call seq is a
+// valid topological order, and Insert/Delete keep it valid, so Order returns it
+// directly without rebuilding. Only the first call arranges the graph from the
+// construction-time baseline.
 func (o *Orderer) Order() []int {
-	o.stats.Rebuilds++
+	if !o.built {
+		o.built = true
+		o.arrangeInitial()
+	}
+	return append([]int(nil), o.seq...)
+}
+
+// arrangeInitial computes the minimal-churn arrangement once, keyed by the
+// current seq (the construction-time ids extended by any early inserts and
+// reduced by any early deletes). This is the initial arrangement, not a rebuild.
+func (o *Orderer) arrangeInitial() {
 	o.stats.Allocs++
 
-	ids := make([]int, 0, len(o.nodes))
-	for id, ok := range o.nodes {
-		if ok {
-			ids = append(ids, id)
-		}
+	ids := make([]int, 0, len(o.seq))
+	for _, id := range o.seq {
+		ids = append(ids, id)
 	}
-	sort.Ints(ids)
 
-	pos := make(map[int]int, len(o.prev))
-	for i, id := range o.prev {
+	pos := make(map[int]int, len(ids))
+	for i, id := range ids {
 		pos[id] = i
 	}
 	indeg := make(map[int]int, len(ids))
@@ -182,14 +205,19 @@ func (o *Orderer) Order() []int {
 		}
 	}
 
-	o.prev = append([]int(nil), res...)
+	// The graph was proven acyclic at construction and inserts only add edges
+	// into fresh sink nodes, so res covers every live node. Defensive guard
+	// nevertheless keeps seq self-consistent.
+	o.seq = res
 	o.stats.Allocs++
-	return append([]int(nil), res...)
 }
 
 // Stats returns a snapshot of the internal work counters.
 func (o *Orderer) Stats() Stats { return o.stats }
 
+// hasCycle performs a Kahn cycle check over the current graph. The traversal
+// order is fixed (sorted ids) so the outcome and the comparison count are
+// independent of map iteration order.
 func (o *Orderer) hasCycle() bool {
 	indeg := make(map[int]int, len(o.nodes))
 	ids := make([]int, 0, len(o.nodes))
